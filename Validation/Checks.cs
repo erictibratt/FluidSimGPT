@@ -197,12 +197,20 @@ public static class Checks
         var merge=headers.Select(p=>s.Boundaries.Ends.Single(b=>b.Pipe==p&&b.Right).Port!.Owner).ToArray();
         Require(merge[0]==merge[3]&&merge[1]==merge[2]&&merge[0]!=merge[1],"4-2-1 pairing");
         Require(s.Boundaries.Ends.Count(b=>b.Open)==2,"NA network must have two ambient open ends");
+        float cruisingSlip=0,cruisingRpm=0,cruisingSpeed=0;
         for(int i=0;i<220500;i++)
         {
             if(i==88200) s.Apply(new(.7f,0,false,1));
             if(i==176400) s.Apply(new(.1f,.3f,true));
             s.Process(); Validate(s);
+            if(i==176399)
+            {
+                cruisingRpm=s.Crank.Rpm; cruisingSpeed=s.Vehicle.Speed;
+                cruisingSlip=MathF.Abs(s.Crank.Omega-s.Vehicle.Speed/s.Vehicle.WheelRadius*s.Vehicle.Ratios[s.Vehicle.Gear]*s.Vehicle.FinalDrive);
+            }
         }
+        Require(cruisingSpeed>1,"B205 first gear must accelerate the car");
+        Require(cruisingSlip<cruisingRpm*(2*MathF.PI/60)*.2f,$"B205 clutch slips excessively at {cruisingRpm:0} RPM and {cruisingSpeed*3.6f:0.0} km/h");
         Require(s.Pipes.Repairs==0,"B205 positivity repairs"); Require(s.Crank.Rpm>200&&s.Crank.Rpm<7000,"B205 engine speed");
     }
     private static void Validate(Scenario s)
