@@ -1,0 +1,120 @@
+# FluidSim
+
+FluidSim is a real-time, interactive simulation of gas flow through engine pipes and volumes. It couples a one-dimensional compressible-flow solver to engine components, visualizes pressure and temperature with SFML, and synthesizes stereo audio from intake, exhaust, mechanical, and reverb sources.
+
+## Requirements
+
+- .NET 10 SDK
+- A desktop environment that supports SFML 3 audio and graphics
+
+The project restores `SFML.Net` from NuGet. Font files are copied to the output directory by the project file.
+
+## Run
+
+From this directory:
+
+```powershell
+dotnet run
+```
+
+The application currently starts `SingleCylScenario`. Despite its historical class name, the current implementation models a roughly 600 cc, two-cylinder parallel twin with two four-stroke cylinders phased 180° apart, a neutral-start drivetrain, a shared intake plenum, and a shared exhaust collector. Other scenarios (`TestScenario`, `HelmholtzScenario`, and `TwoStrokeScenario`) are in the source tree, but there is no scenario-selection menu yet.
+
+## Controls
+
+| Input | Action |
+| --- | --- |
+| Hold `W` | Apply throttle (the up/down arrows adjust the target throttle) |
+| `Up` / `Down` | Increase / decrease the throttle target |
+| `Right` / `Left` | Increase / decrease brake load |
+| Hold `C` | Disengage the clutch input |
+| Mouse wheel | Increase / decrease playback and simulation speed |
+| `Space` | Toggle real-time playback speed and the last selected speed |
+| `Q` / `E` | Shift the drivetrain down / up |
+
+The speed readout and ring-buffer fill are shown in the on-screen overlay. Playback speed is initially set to slow motion.
+
+## How it is structured
+
+- `Core/PipeSystem.cs` stores the pipe-cell state and computes finite-volume fluxes. It uses `System.Numerics.Vector<float>` for vectorized portions of the solver.
+- `Core/BoundarySystem.cs` connects pipes to component ports and open ends.
+- `Core/Solver.cs` chooses CFL-based substeps, resolves boundaries, advances pipes, and updates components.
+- `Components/` contains the engine, cylinder, crankshaft, volumes, atmosphere, and vehicle models.
+- `Scenarios/` assembles complete simulations and provides drawing and per-sample processing.
+- `Core/` also contains sound synthesis and acoustic processing, including radiation, mechanical sound, and reverb.
+- `Audio/` streams stereo samples through a bounded producer-consumer ring buffer to SFML.
+- `Program.cs` creates the window and audio stream, handles keyboard and mouse input, and runs simulation on a background task.
+
+## Recreating the simulation
+
+### 1. Use a fixed simulation clock
+
+Set the simulation time step to `dt = 1 / sampleRate`; the app uses 44,100 steps per simulated second. Each call to `Scenario.Process()` advances exactly one global step and produces one stereo frame. This fixed clock makes the engine model and audio DSP sample-synchronous. The UI changes playback rate by changing how quickly the audio consumer advances through those generated frames; at slow playback the producer waits when the queue has enough samples.
+
+### 2. Represent the fluid network
+
+Create a `PipeSystem` with a flat set of cell arrays and a start/end range for each pipe. The current twin scenario allocates 70 cells across seven 10-cell pipe segments. Store each cell's density `rho`, momentum density `m = rho*u`, total energy density `E`, and air mass fraction `Y`, plus cell area and length `dx`. Pressure and velocity are recovered as:
+
+```text
+u = m / rho
+p = (gamma - 1) * (E - 0.5 * m * u)
+gamma = 1.4
+```
+
+The pressure formula is equivalent to subtracting kinetic-energy density from total-energy density. `Y` is transported as the passive conserved quantity `rho*Y` so air and exhaust gas can be distinguished in components.
+
+The current pipe update uses the standard 1D flux difference with `dx`; it does not add a quasi-1D area-gradient source term. Cell area is used for drawing and boundary mass limits/orifice coupling. Preserve this detail for a numerically similar recreation, or add the area source term deliberately if the goal is a more physically complete variable-area duct model.
+
+### 3. Advance compressible flow
+
+For each interior face, form the 1D Euler state and flux:
+
+```text
+U = [rho, m, E, rho*Y]
+F = [m, m*u + p, (E+p)*u, m*Y]
+alpha = max(abs(uL)+cL, abs(uR)+cR), c = sqrt(gamma*p/rho)
+Fface = 0.5*(F_L+F_R) - 0.5*alpha*(U_R-U_L)
+```
+
+This is a local Lax-Friedrichs (Rusanov) flux. Update each conserved cell quantity with `U_new = U_old - dt/dx * (F_right - F_left)`. Pipe endpoints use separate left/right boundary fluxes, because neighboring pipe segments do not share a cell face. The implementation vectorizes interior faces and cell updates with `System.Numerics.Vector<float>` and uses scalar code around segment boundaries and remainders.
+
+The implementation also has optional momentum damping and energy relaxation toward ambient energy, plus floors/clamps for density, energy and mixture fraction. These are numerical/sound-stability controls, not part of the ideal Euler equations.
+
+Before each global step, estimate the largest `abs(u)+c` over the cells and choose enough substeps that `dt_sub * maxWaveSpeed / minDx <= 0.8`; also enforce the configured minimum substep count. Each substep resolves orifice and open-end boundary states, computes fluxes, and updates pipe cells. After the substeps, update each attached 0D component once for the full global `dt`.
+
+### 4. Couple pipes to volumes and cylinder ports
+
+`Port.MassFlowRate` is signed positive into its owning component. `BoundarySystem` reads component and pipe pressure, density, temperature and mixture fraction, then writes a ghost state at the pipe end. A closed valve is handled as a reflecting wall: retain the adjacent pipe state and reverse its velocity. An open orifice uses an isentropic compressible-flow estimate, limits flow so a cell or volume cannot lose more mass than it contains during the step, and supplies port enthalpy for the component's energy balance. Optional orifice inertance integrates `dm/dt = (pressureDifference - linearResistance*m) / inertance` and clamps face speed.
+
+An open pipe end uses characteristic invariants based on `u +/- 2c/(gamma-1)` to determine an ambient-coupled ghost state; supersonic outflow copies the interior state. Each open end retains its latest mass flow for sound generation.
+
+`Volume0D` is a well-mixed ideal-gas reservoir. It sums signed port mass and enthalpy rates, updates air/exhaust mass and internal energy, optionally relaxes temperature toward ambient, and refreshes its port states. Keep port sign and enthalpy conventions consistent when recreating the boundary coupling.
+
+### 5. Model engine mechanics and combustion
+
+`Crankshaft.Step(dt)` integrates net torque using angular acceleration `alpha = torque / inertia`, updates angular speed and crank angle, and keeps rolling averages of torque and power. `EngineCylinder.PreStep(dt)` calculates piston position from crank-slider geometry, updates instantaneous cylinder volume, applies approximate `p*dV` work and wall heat loss, handles cycle events, and publishes thermodynamic values to intake/exhaust ports. After flow boundaries have set port flows, `UpdateState(dt)` integrates cylinder mass and enthalpy.
+
+The four-stroke cylinder computes intake and exhaust curtain area from valve timing and a smooth open/hold/close lift profile. At intake closing it estimates trapped air and fuel mass from stoichiometric AFR. At spark it starts a Wiebe burn curve; each burn-fraction increment adds fuel heating-value energy and moves burned gas into the exhaust fraction. A timer and hysteresis implement the rev limiter. For the current twin, instantiate two cylinders on one crankshaft and set the second `PhaseOffset` to `pi` radians.
+
+`Vehicle.Update` approximates gear ratios, road resistance, clutch slip torque, stall prevention and reflected inertia. The current scenario starts in neutral; `Q`/`E` call the gear shift methods and `C` applies clutch input. A load control also adds brake torque to the crankshaft.
+
+### 6. Generate and spatialize audio
+
+After the solver step, read the intake and exhaust open-end mass-flow rates. Each `RadiationSource` smooths flow, differentiates it to approximate pressure excitation, applies distance/directivity scaling and soft saturation, then models air absorption, ear-to-ear delay, level difference and far-ear head shadow. Its mono pressure signal is sent to the reverb before binaural processing.
+
+The reverb combines predelay and early ground/wall reflections with an eight-line feedback-delay network. The feedback is divided into low, mid and high bands, with decay and transient-dependent feedback gains, then split into left/right output. Optional mechanical sound synthesizes crank/valve/combustion-related events from crank angle and cylinder state. Mix direct intake/exhaust, wet reverb and mechanical sound; apply a `tanh` flow-bus limiter and clamp final left/right samples to `[-1, 1]`.
+
+### 7. Separate simulation, audio and drawing
+
+The main thread owns SFML window events and draws at up to 60 Hz. It pre-fills a power-of-two stereo ring buffer with 1,024 frames, starts the SFML `SoundStream`, then starts a simulation producer task. The producer advances `Scenario.Process()` and writes `LastMixL/LastMixR`; it waits once the buffer exceeds its target fill. The audio callback reads blocks of 512 frames, uses linear interpolation at the selected playback speed, applies a DC blocker, converts samples to 16-bit stereo PCM, and zero-fills any short read. The current callback allocates a PCM array for each block; a production-oriented recreation can reuse that memory if supported by its audio API.
+
+For a robust recreation, publish a render snapshot from the simulation thread instead of letting the drawing thread read mutable solver/component state directly. Keep SFML graphics calls on the window thread and keep the audio callback allocation-free where the audio framework permits it.
+
+## Configuration notes
+
+The active scenario and sample rate are selected in `Program.cs`. Engine geometry, pipe layout, sound levels, reverb, drivetrain and rev-limiter defaults are configured in `Scenarios/SingleCylScenario.cs`. Solver controls such as the minimum substep count and profiling flags are set where each scenario constructs its `Solver`.
+
+Profiling output can be enabled in a scenario through `Solver.EnableProfiling` and `PipeSystem.EnableProfiling`. The current application entry point selects the single-cylinder scenario, whose solver profiling is disabled by default.
+
+## Current scope
+
+This is an experimental simulator rather than a general-purpose engine-design or acoustics package. Flow and engine behavior use simplified models and tuning parameters. The repository does not currently include a dedicated test project or README-level validation procedure.

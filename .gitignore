@@ -1,0 +1,5 @@
+bin/
+obj/
+*.wav
+smoke.png
+.vs/
