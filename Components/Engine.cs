@@ -111,14 +111,25 @@ public sealed class Vehicle
     public float Mass=220, WheelRadius=.3f, FinalDrive=3.2f, RollingForce=12, DragCoefficient=.4f, ClutchCapacity=75;
     public readonly float[] Ratios=[0,2.8f,2.0f,1.55f,1.25f,1.05f,.9f];
     public int MaximumGear=6;
-    public void Shift(int direction) => Gear=Math.Clamp(Gear+direction,0,MaximumGear);
+    private float engagement, shiftRelease;
+    public void Shift(int direction)
+    {
+        int next=Math.Clamp(Gear+direction,0,Math.Min(MaximumGear,Ratios.Length-1));
+        if(next==Gear) return;
+        Gear=next;
+        engagement=0;
+        shiftRelease=.12f;
+    }
     public float Update(float dt,Crankshaft crank,bool clutch)
     {
         float ratio=Ratios[Gear]*FinalDrive;
-        float engage=clutch || Gear==0?0:Math.Clamp((crank.Rpm-650)/650,0,1);
-        ClutchTorque=Math.Clamp((crank.Omega-Speed/WheelRadius*ratio)*.35f,-ClutchCapacity,ClutchCapacity)*engage;
+        shiftRelease=MathF.Max(0,shiftRelease-dt);
+        float target=clutch || Gear==0 || shiftRelease>0?0:Math.Clamp((crank.Rpm-550)/350,0,1);
+        engagement=target<engagement?target:MathF.Min(target,engagement+dt*3.5f);
+        ClutchTorque=Math.Clamp((crank.Omega-Speed/WheelRadius*ratio)*12f,-ClutchCapacity,ClutchCapacity)*engagement;
         Speed=MathF.Max(0,Speed+dt*(ClutchTorque*ratio/WheelRadius-RollingForce-DragCoefficient*Speed*Speed)/Mass);
-        ReflectedInertia=engage*.015f;
+        // The wheel's inertia is already represented by the opposing clutch torque.
+        ReflectedInertia=0;
         return ClutchTorque;
     }
 }

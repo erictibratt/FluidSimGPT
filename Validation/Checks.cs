@@ -93,6 +93,22 @@ public static class Checks
                 Require(s.Vehicle.Speed>1,"engaged drivetrain moves vehicle");
                 Require(s.Pipes.Repairs==0,"positivity repairs required"); Console.WriteLine($"  final RPM {s.Crank.Rpm:0}; road speed {s.Vehicle.Speed*3.6:0.0} km/h");
             }),
+            ("Gear coupling, shift release and clutch pedal",()=>
+            {
+                var crank=new Crankshaft { Omega=200 };
+                var car=new Vehicle { Mass=1400,WheelRadius=.31f,FinalDrive=4.05f,ClutchCapacity=240 };
+                car.Ratios[1]=3.38f; car.Ratios[2]=1.76f;
+                car.Shift(1);
+                Near(car.Update(.01f,crank,false),0,0,"shift must release clutch");
+                for(int i=0;i<60;i++) car.Update(.01f,crank,false);
+                Require(car.ClutchTorque>100,"first gear must couple engine to wheels");
+                car.Shift(1);
+                Near(car.Update(.01f,crank,false),0,0,"upshift must release clutch");
+                for(int i=0;i<60;i++) car.Update(.01f,crank,false);
+                Require(car.Gear==2 && car.ClutchTorque>0,"second gear must transmit drive");
+                Near(car.Update(.01f,crank,true),0,0,"clutch pedal must disengage drive");
+                car.Shift(-1); Require(car.Gear==1,"downshift must select first");
+            }),
             ("Alternative scenarios",()=> { foreach(Scenario s in new Scenario[]{new TestScenario(),new HelmholtzScenario(),new TwoStrokeScenario()}) for(int i=0;i<22050;i++) { s.Process(); Validate(s); } })
         ];
         int failures=0; var watch=Stopwatch.StartNew();
