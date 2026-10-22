@@ -29,8 +29,9 @@ public sealed class PlaybackProcessor(StereoRingBuffer ring)
             lastL=l; lastR=r;
             // About 10 Hz: remove DC without deleting the low engine fundamental.
             dcL=l-previousL+.998576f*dcL; dcR=r-previousR+.998576f*dcR; previousL=l; previousR=r;
-            Samples[i*2]=(short)(Math.Clamp(dcL,-1,1)*32767);
-            Samples[i*2+1]=(short)(Math.Clamp(dcR,-1,1)*32767);
+            // Raise the quiet synthesized mix while soft-limiting loud transients.
+            Samples[i*2]=(short)(MathF.Tanh(dcL*2.5f)*32767);
+            Samples[i*2+1]=(short)(MathF.Tanh(dcR*2.5f)*32767);
         }
     }
 }

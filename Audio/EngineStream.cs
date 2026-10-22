@@ -8,7 +8,7 @@ public sealed class EngineStream : SoundStream
     public EngineStream(StereoRingBuffer ring)
     {
         playback=new(ring);
-        Initialize(2,44100,[SoundChannel.FrontLeft,SoundChannel.FrontRight]); Volume=65;
+        Initialize(2,44100,[SoundChannel.FrontLeft,SoundChannel.FrontRight]); Volume=100;
     }
     protected override bool OnGetData(out short[] samples)
     {
