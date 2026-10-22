@@ -21,6 +21,11 @@ public sealed class EngineCylinder : Volume0D
     public double PhaseOffset;
     public float Bore=.072f, Stroke=.0737f, Rod=.125f, Compression=10.5f;
     public float SparkAdvance=.24f, BurnDuration=1.25f, RevLimit=9500;
+    public float IntakeOpen=-.18f, IntakeClose=MathF.PI+.7f;
+    public float ExhaustOpen=3*MathF.PI-.8f, ExhaustClose=4*MathF.PI+.2f;
+    public float IntakeMaxArea=.00065f, ExhaustMaxArea=.00055f;
+    public float IntakeValveDiameter, ExhaustValveDiameter, IntakeMaxLift, ExhaustMaxLift;
+    public int ValvesPerSide=2;
     public float Torque, BurnPulse, IntakeLift, ExhaustLift;
     public float Displacement => MathF.PI*Bore*Bore*.25f*Stroke;
     public bool TwoStroke;
@@ -33,6 +38,13 @@ public sealed class EngineCylinder : Volume0D
         Volume=VolumeAt((float)phase); Mass=Gas.AmbientPressure*Volume/(Gas.R*Gas.AmbientTemperature);
         AirMass=Mass; InternalEnergy=Mass*Gas.Cv*Gas.AmbientTemperature;
     }
+    public void ResetCharge()
+    {
+        Volume=VolumeAt((float)PhaseOffset);
+        Mass=Gas.AmbientPressure*Volume/(Gas.R*Gas.AmbientTemperature);
+        AirMass=Mass; InternalEnergy=Mass*Gas.Cv*Gas.AmbientTemperature;
+    }
+    public static float CurtainArea(float lift,float diameter,int count) => MathF.Min(count*MathF.PI*diameter*lift,count*MathF.PI*diameter*diameter*.25f);
     public float VolumeAt(float angle)
     {
         float r=Stroke*.5f,s=MathF.Sin(angle);
@@ -60,10 +72,11 @@ public sealed class EngineCylinder : Volume0D
         InternalEnergy*=Math.Pow(old/Volume,Gas.Gamma-1);
         InternalEnergy+=(Mass*Gas.Cv*420-InternalEnergy)*Math.Min(.02,dt*12);
         Torque=delta>1e-10?(p-Gas.AmbientPressure)*dv/(float)delta:0;
-        IntakeLift=TwoStroke?Window(local,3.45,5.1):Lift(local,-.18,Math.PI+ .7);
-        ExhaustLift=TwoStroke?Window(local,2.4,4.8):Lift(local,3*Math.PI-.8,4*Math.PI+.2);
-        Intake.Area=IntakeLift*.00065f; Exhaust.Area=ExhaustLift*.00055f;
-        double intakeClose=TwoStroke?5.1:Math.PI+.7;
+        IntakeLift=TwoStroke?Window(local,3.45,5.1):Lift(local,IntakeOpen,IntakeClose);
+        ExhaustLift=TwoStroke?Window(local,2.4,4.8):Lift(local,ExhaustOpen,ExhaustClose);
+        Intake.Area=IntakeValveDiameter>0?CurtainArea(IntakeLift*IntakeMaxLift,IntakeValveDiameter,ValvesPerSide):IntakeLift*IntakeMaxArea;
+        Exhaust.Area=ExhaustValveDiameter>0?CurtainArea(ExhaustLift*ExhaustMaxLift,ExhaustValveDiameter,ValvesPerSide):ExhaustLift*ExhaustMaxArea;
+        double intakeClose=TwoStroke?5.1:IntakeClose;
         if(Crossed(previousLocal,local,intakeClose,period)) fuelEnergy=AirMass/14.7*44e6*.90;
         if(crank.Rpm>RevLimit) { limiting=true; limiterTime=.06; }
         limiterTime-=dt;
@@ -95,14 +108,16 @@ public sealed class Vehicle
 {
     public int Gear { get; private set; }
     public float Speed, ClutchTorque, ReflectedInertia;
+    public float Mass=220, WheelRadius=.3f, FinalDrive=3.2f, RollingForce=12, DragCoefficient=.4f, ClutchCapacity=75;
     public readonly float[] Ratios=[0,2.8f,2.0f,1.55f,1.25f,1.05f,.9f];
-    public void Shift(int direction) => Gear=Math.Clamp(Gear+direction,0,Ratios.Length-1);
+    public int MaximumGear=6;
+    public void Shift(int direction) => Gear=Math.Clamp(Gear+direction,0,MaximumGear);
     public float Update(float dt,Crankshaft crank,bool clutch)
     {
-        float ratio=Ratios[Gear]*3.2f;
+        float ratio=Ratios[Gear]*FinalDrive;
         float engage=clutch || Gear==0?0:Math.Clamp((crank.Rpm-650)/650,0,1);
-        ClutchTorque=Math.Clamp((crank.Omega-Speed/.3f*ratio)*.35f,-75,75)*engage;
-        Speed=MathF.Max(0,Speed+dt*(ClutchTorque*ratio/.3f-12-.4f*Speed*Speed)/220);
+        ClutchTorque=Math.Clamp((crank.Omega-Speed/WheelRadius*ratio)*.35f,-ClutchCapacity,ClutchCapacity)*engage;
+        Speed=MathF.Max(0,Speed+dt*(ClutchTorque*ratio/WheelRadius-RollingForce-DragCoefficient*Speed*Speed)/Mass);
         ReflectedInertia=engage*.015f;
         return ClutchTorque;
     }

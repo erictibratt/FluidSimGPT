@@ -12,6 +12,8 @@ public static class Checks
     public static int Run()
     {
         (string Name,Action Test)[] tests=[
+            ("B205 geometry, cam events, firing order, NA network and stability",SaabValidation),
+            ("Orifice table against analytic compressible flow",OrificeTable),
             ("SIMD/scalar agreement, segment edges and remainders",SimdAgreement),
             ("Euler uniform flux",()=> { var s=State.FromPT(101325,300,25,.7f); var f=State.Rusanov(s,s); Near(f.Rho,s.M,1e-5,"mass flux"); Near(f.E,s.Flux.E,1,"energy flux"); }),
             ("Uniform pipe and reflecting wall",()=>
@@ -64,14 +66,14 @@ public static class Checks
                     previous=samples[^2]; playback.Fill(1);
                     for(int i=0;i<samples.Length;i+=2)
                     {
-                        Require(Math.Abs(samples[i]-previous)<450,"starvation introduces discontinuity");
+                        Require(Math.Abs(samples[i]-previous)<900,"starvation introduces discontinuity at 2.5x output gain");
                         previous=samples[i];
                     }
                 }
                 Require(ring.Underruns>0,"exercise starvation path");
                 for(int i=0;i<5000;i++) ring.Write(.3f,.3f);
                 previous=samples[^2]; playback.Fill(1);
-                Require(Math.Abs(samples[0]-previous)<450,"recovery click");
+                Require(Math.Abs(samples[0]-previous)<900,"recovery click at 2.5x output gain");
                 GC.Collect(2,GCCollectionMode.Forced,true,true);
                 Require(address==System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(samples,0),"PCM pointer moved during GC");
                 Require(ReferenceEquals(samples,playback.Samples),"callback allocated replacement PCM");
@@ -100,8 +102,11 @@ public static class Checks
     private static void Conservation()
     {
         var p=new PipeSystem { MomentumDamping=0,ThermalRelaxation=0 }; var pipe=p.Add("closed system",.5f,.001f,0,0,1,0);
+        var second=p.Add("second closed branch",.5f,.001f,0,0,1,0);
+        for(int i=0;i<second.Count;i++) p.Set(second.Start+i,State.FromPT(90000,300));
         var v=new Volume0D("reservoir",.001f,140000) { HeatRelaxation=0 };
         var b=new BoundarySystem(p); b.Connect(pipe,false); var port=v.AddPort(.001f); b.Connect(pipe,true,port);
+        b.Connect(second,false,v.AddPort(.001f)); b.Connect(second,true);
         var solver=new Solver(p,b,[v]);
         double Mass()=>v.Mass+p.Rho.Sum(x=>(double)x*pipe.Area*pipe.Dx);
         double Energy()=>v.InternalEnergy+p.Energy.Sum(x=>(double)x*pipe.Area*pipe.Dx);
@@ -114,10 +119,11 @@ public static class Checks
     {
         var scalar=new PipeSystem { UseSimd=false }; var simd=new PipeSystem();
         var bs=new BoundarySystem(scalar); var bv=new BoundarySystem(simd);
-        foreach(int count in new[]{1,3,7,8,10,17,31})
+        foreach(int count in new[]{1,3,7,8,10,12,16,17,31})
         {
             var a=scalar.Add($"scalar {count}",.05f*count,.001f,0,0,1,0,count);
             var b=simd.Add($"simd {count}",.05f*count,.001f,0,0,1,0,count);
+            a.FrictionFactor=b.FrictionFactor=.025f;
             bs.Connect(a,false); bs.Connect(a,true); bv.Connect(b,false); bv.Connect(b,true);
             for(int j=0;j<count;j++)
             {
@@ -139,6 +145,50 @@ public static class Checks
         }
         Require(simd.Repairs==scalar.Repairs,"SIMD repair accounting");
     }
+    private static void OrificeTable()
+    {
+        var a=State.FromPT(200000,300);
+        for(int i=1;i<2000;i++)
+        {
+            double ratio=.0005*i,g=Gas.Gamma,critical=Math.Pow(2/(g+1),g/(g-1));
+            double f=ratio<=critical?Math.Sqrt(g)*Math.Pow(2/(g+1),(g+1)/(2*(g-1))):Math.Sqrt(2*g/(g-1)*(Math.Pow(ratio,2/g)-Math.Pow(ratio,(g+1)/g)));
+            double expected=.72*.001*a.P/Math.Sqrt(Gas.R*a.T)*f;
+            Near(BoundarySystem.Orifice(a,State.FromPT((float)(a.P*ratio),300),.001f),expected,Math.Max(.000002,expected*.00015),"orifice lookup error");
+        }
+    }
+    private static void SaabValidation()
+    {
+        var s=new SaabB205Scenario();
+        Near(s.Cylinders.Sum(c=>c.Displacement)*1e6,1984.91,.2,"B205 displacement");
+        foreach(var c in s.Cylinders)
+        {
+            Near(c.Rod,.159,1e-6,"B205 rod"); Near(c.Compression,8.8,1e-5,"stock compression");
+            Near(c.IntakeMaxLift,.00831,1e-7,"intake lift"); Near(c.ExhaustMaxLift,.00807,1e-7,"exhaust lift");
+            Near(c.VolumeAt(MathF.PI)/c.VolumeAt(0),8.8,1e-5,"compression geometry");
+            Require(EngineCylinder.Lift(c.IntakeOpen-.01, c.IntakeOpen,c.IntakeClose)==0,"intake opens too early");
+            Require(EngineCylinder.Lift(c.IntakeClose+.01,c.IntakeOpen,c.IntakeClose)==0,"intake closes too late");
+        }
+        var eventOrder=new List<int>(); double period=4*Math.PI;
+        double start=2*Math.PI-s.Cylinders[0].SparkAdvance;
+        for(int eventIndex=0;eventIndex<4;eventIndex++)
+        {
+            double eventAngle=start+eventIndex*Math.PI;
+            for(int cylinder=0;cylinder<4;cylinder++)
+                if(EngineCylinder.Crossed(eventAngle+s.Cylinders[cylinder].PhaseOffset-.001,eventAngle+s.Cylinders[cylinder].PhaseOffset+.001,start,period)) eventOrder.Add(cylinder+1);
+        }
+        Require(eventOrder.SequenceEqual(new[]{1,3,4,2}),"incorrect firing order");
+        var headers=s.Pipes.Pipes.Where(p=>p.Name.StartsWith("PRIMARY")).ToArray();
+        var merge=headers.Select(p=>s.Boundaries.Ends.Single(b=>b.Pipe==p&&b.Right).Port!.Owner).ToArray();
+        Require(merge[0]==merge[3]&&merge[1]==merge[2]&&merge[0]!=merge[1],"4-2-1 pairing");
+        Require(s.Boundaries.Ends.Count(b=>b.Open)==2,"NA network must have two ambient open ends");
+        for(int i=0;i<220500;i++)
+        {
+            if(i==88200) s.Apply(new(.7f,0,false,1));
+            if(i==176400) s.Apply(new(.1f,.3f,true));
+            s.Process(); Validate(s);
+        }
+        Require(s.Pipes.Repairs==0,"B205 positivity repairs"); Require(s.Crank.Rpm>200&&s.Crank.Rpm<7000,"B205 engine speed");
+    }
     private static void Validate(Scenario s)
     {
         Require(float.IsFinite(s.LastMixL)&&float.IsFinite(s.LastMixR)&&MathF.Abs(s.LastMixL)<=1&&MathF.Abs(s.LastMixR)<=1,"audio bounds");
@@ -148,6 +198,7 @@ public static class Checks
     public static int Headless(Scenario s,string[] args)
     {
         s.Pipes.UseSimd=!args.Contains("--scalar");
+        s.Solver.EnableProfiling=args.Contains("--profile");
         if(args.Contains("--flow-only")) { s.Mixer.Mechanical=0; s.Mixer.Wet=0; }
         double seconds=double.Parse(args.FirstOrDefault(a=>a.StartsWith("--seconds="))?.Split('=')[1]??"5",System.Globalization.CultureInfo.InvariantCulture);
         string? wav=args.FirstOrDefault(a=>a.StartsWith("--wav="))?.Substring(6);
@@ -155,13 +206,20 @@ public static class Checks
         int frames=checked((int)(seconds*Scenario.SampleRate));
         if(file!=null) { file.Write("RIFF"u8); file.Write(36+frames*4); file.Write("WAVEfmt "u8); file.Write(16); file.Write((short)1); file.Write((short)2); file.Write(44100); file.Write(176400); file.Write((short)4); file.Write((short)16); file.Write("data"u8); file.Write(frames*4); }
         var watch=Stopwatch.StartNew(); float peak=0; double square=0;
+        double idleSeconds=double.Parse(args.FirstOrDefault(a=>a.StartsWith("--idle-seconds="))?.Split('=')[1]??"1",System.Globalization.CultureInfo.InvariantCulture);
+        float throttle=float.Parse(args.FirstOrDefault(a=>a.StartsWith("--throttle="))?.Split('=')[1]??"0.65",System.Globalization.CultureInfo.InvariantCulture);
         for(int i=0;i<frames;i++)
         {
-            if(i%44100==0) { s.Apply(new(i<44100?0:.65f)); Console.WriteLine($"t={i/44100}s rpm={s.Crank.Rpm:0} max T={s.Capture().Temperature.Max():0} K"); }
+            if(i%44100==0) { s.Apply(new(i<idleSeconds*44100?0:throttle)); Console.WriteLine($"t={i/44100}s rpm={s.Crank.Rpm:0} max T={s.Capture().Temperature.Max():0} K"); }
             s.Process(); Validate(s); peak=MathF.Max(peak,MathF.Abs(s.LastMixL)); square+=s.LastMixL*s.LastMixL;
             file?.Write((short)(s.LastMixL*32767)); file?.Write((short)(s.LastMixR*32767));
         }
         Console.WriteLine($"{s.Name}: {seconds}s in {watch.Elapsed.TotalSeconds:0.00}s; RPM {s.Crank.Rpm:0}; peak {peak:0.000}; RMS {Math.Sqrt(square/frames):0.000}; repairs {s.Pipes.Repairs}; SIMD {s.Pipes.UseSimd&&System.Numerics.Vector.IsHardwareAccelerated}, lanes {System.Numerics.Vector<float>.Count}");
+        if(s.Solver.EnableProfiling)
+        {
+            double scale=1000.0/Stopwatch.Frequency;
+            Console.WriteLine($"Solver profile: boundaries {s.Solver.BoundaryTicks*scale:0.0} ms; pipes {s.Solver.PipeTicks*scale:0.0} ms; components {s.Solver.ComponentTicks*scale:0.0} ms");
+        }
         return 0;
     }
 }

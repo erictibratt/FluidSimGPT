@@ -4,6 +4,8 @@ namespace FluidSim.Core;
 public sealed record Pipe(string Name, int Start, int Count, float Dx, float Area, float X1, float Y1, float X2, float Y2)
 {
     internal State LeftFlux,RightFlux;
+    public float FrictionFactor;
+    internal float FrictionRate => FrictionFactor/(2*MathF.Sqrt(4*Area/MathF.PI));
 }
 
 public sealed class PipeSystem
@@ -54,10 +56,18 @@ public sealed class PipeSystem
         float damping=MathF.Exp(-MomentumDamping*dt),relaxation=MathF.Min(1,ThermalRelaxation*dt);
         foreach(var p in Pipes)
         {
+            float drag=p.FrictionFactor>0?p.FrictionRate*dt:0;
             Store(offset,boundaries.Flux(p,false));
             int face=1;
             // Never span segment boundaries: all lanes are interior faces of this pipe.
             if(simd) for(;face+w<=p.Count;face+=w) InteriorFlux(p.Start+face-1,offset+face);
+            // Fluxes only read old state: an overlapping final vector is safe and avoids
+            // seven scalar faces on the common 16-cell runner/header segments (AVX2).
+            if(simd && p.Count> w && p.Count-face>=3)
+            {
+                InteriorFlux(p.Start+p.Count-w-1,offset+p.Count-w);
+                face=p.Count;
+            }
             for(;face<p.Count;face++) Store(offset+face,State.Rusanov(Get(p.Start+face-1),Get(p.Start+face)));
             Store(offset+p.Count,boundaries.Flux(p,true));
             float k=dt/p.Dx; int jv=0;
@@ -74,6 +84,7 @@ public sealed class PipeSystem
                     for(int lane=0;lane<w;lane++) if(repaired[lane]!=0) Repairs++;
                 e=Vector.Max(minE,e); a=Vector.Min(Vector.Max(Vector<float>.Zero,a),safeR);
                 m*=new Vector<float>(damping);
+                if(drag>0) m/=Vector<float>.One+new Vector<float>(drag)*Vector.Abs(m/safeR);
                 e+=(safeR*new Vector<float>(Gas.Cv*Gas.AmbientTemperature)+new Vector<float>(.5f)*m*m/safeR-e)*new Vector<float>(relaxation);
                 safeR.CopyTo(Rho,i); m.CopyTo(Momentum,i); e.CopyTo(Energy,i); a.CopyTo(Air,i);
             }
@@ -95,6 +106,7 @@ public sealed class PipeSystem
                 if(r!=Rho[i] || Energy[i]<kinetic+10) Repairs++;
                 Rho[i]=r; Energy[i]=MathF.Max(kinetic+10,Energy[i]); Air[i]=Math.Clamp(Air[i],0,r);
                 Momentum[i]*=damping;
+                if(drag>0) Momentum[i]/=1+drag*MathF.Abs(Momentum[i]/r);
                 Energy[i]+=(r*Gas.Cv*Gas.AmbientTemperature+.5f*Momentum[i]*Momentum[i]/r-Energy[i])*relaxation;
             }
             offset+=p.Count+1;

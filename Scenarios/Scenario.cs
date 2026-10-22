@@ -18,6 +18,11 @@ public abstract class Scenario
     public readonly SoundMixer Mixer=new();
     public Solver Solver=null!;
     public float LastMixL,LastMixR,Throttle,Brake;
+    public float IdleTarget=1050, StarterGain=.06f, StarterMax=55, FrictionBase=1.2f,FrictionSpeed=.007f,BrakeCapacity=65;
+    protected float ThrottleLeak=.000012f,ThrottleArea=.001f;
+    public readonly List<VolumeVisual> VolumeVisuals=[];
+    public readonly List<CylinderVisual> CylinderVisuals=[];
+    public virtual string Description => "EXPERIMENTAL ENGINE / FLOW LAB";
     public abstract string Name { get; }
     protected Boundary? IntakeEnd,ExhaustEnd;
     protected Port? ThrottlePort;
@@ -31,15 +36,15 @@ public abstract class Scenario
     private bool clutch;
     public virtual void Process()
     {
-        if(ThrottlePort!=null) ThrottlePort.Area=.000012f+Throttle*.001f;
+        if(ThrottlePort!=null) ThrottlePort.Area=ThrottleLeak+Throttle*ThrottleArea;
         foreach(var c in Cylinders) c.PreStep(Dt,Crank);
         Solver.Step(Dt);
         float torque=0,burn=0;
         foreach(var c in Cylinders) { torque+=c.Torque; burn+=c.BurnPulse; }
-        float starter=Cylinders.Count>0?Math.Clamp((1050-Crank.Rpm)*.06f,0,55):0;
+        float starter=Cylinders.Count>0?Math.Clamp((IdleTarget-Crank.Rpm)*StarterGain,0,StarterMax):0;
         float load=Vehicle.Update(Dt,Crank,clutch);
-        float friction=1.2f+Crank.Omega*.007f;
-        Crank.Step(Dt,torque+starter-friction-Brake*65-load,Vehicle.ReflectedInertia);
+        float friction=FrictionBase+Crank.Omega*FrictionSpeed;
+        Crank.Step(Dt,torque+starter-friction-Brake*BrakeCapacity-load,Vehicle.ReflectedInertia);
         (LastMixL,LastMixR)=Mixer.Process(IntakeEnd?.LastMassFlow??0,ExhaustEnd?.LastMassFlow??0,Crank.Angle,Crank.Rpm,burn);
     }
     public Snapshot Capture() => new(
@@ -49,6 +54,8 @@ public abstract class Scenario
         Cylinders.Select(c=>c.IntakeLift).ToArray(),Cylinders.Select(c=>c.ExhaustLift).ToArray(),
         Crank.Rpm,Throttle,Brake,Vehicle.Gear,Vehicle.Speed,Crank.AverageTorque,Crank.AveragePower,Crank.Angle,Solver.LastSubsteps,Pipes.Repairs,LastMixL,LastMixR);
 }
+public sealed record VolumeVisual(string Name,float X,float Y,float Width,float Height);
+public sealed record CylinderVisual(float X,float Y,float Width=140,float Height=85);
 
 public class SingleCylScenario : Scenario
 {
@@ -62,6 +69,8 @@ public class SingleCylScenario : Scenario
         ThrottlePort=plenum.AddPort(.00002f); Boundaries.Connect(inlet,true,ThrottlePort);
         var c1=new EngineCylinder("Cylinder 1",0,twoStroke); var c2=new EngineCylinder("Cylinder 2",Math.PI,twoStroke);
         Cylinders.Add(c1); Cylinders.Add(c2); Components.Add(c1); Components.Add(c2);
+        CylinderVisuals.Add(new(510,231)); CylinderVisuals.Add(new(510,441));
+        VolumeVisuals.Add(new("PLENUM",310,290,40,65)); VolumeVisuals.Add(new("MERGE",820,330,35,65)); VolumeVisuals.Add(new("MUFFLER",1020,337,25,50));
         for(int i=0;i<2;i++)
         {
             float y=i==0?260:470;
