@@ -13,6 +13,7 @@ public static class App
     public static int Run(string[] args)
     {
         if(args.Contains("--self-test")) return Checks.Run();
+        if(args.Contains("--benchmark")) return Benchmark.Run();
         string option=args.FirstOrDefault(a=>a.StartsWith("--scenario="))?.Split('=')[1]??"twin";
         Scenario scenario=option switch { "test"=>new TestScenario(),"helmholtz"=>new HelmholtzScenario(),"two-stroke"=>new TwoStrokeScenario(),_=>new SingleCylScenario() };
         if(args.Contains("--headless")) return Checks.Headless(scenario,args);
@@ -38,7 +39,8 @@ public static class App
         };
         // Warm up tiered JIT before starting the time-critical audio consumer.
         for(int i=0;i<4410;i++) scenario.Process();
-        for(int i=0;i<1024;i++) { scenario.Process(); ring.Write(scenario.LastMixL,scenario.LastMixR); }
+        // SFML queues several blocks immediately; 1,024 frames starved on startup at 1x.
+        for(int i=0;i<8192;i++) { scenario.Process(); ring.Write(scenario.LastMixL,scenario.LastMixR); }
         var producer=Task.Run(()=>
         {
             try

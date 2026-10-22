@@ -12,6 +12,7 @@ public static class Checks
     public static int Run()
     {
         (string Name,Action Test)[] tests=[
+            ("SIMD/scalar agreement, segment edges and remainders",SimdAgreement),
             ("Euler uniform flux",()=> { var s=State.FromPT(101325,300,25,.7f); var f=State.Rusanov(s,s); Near(f.Rho,s.M,1e-5,"mass flux"); Near(f.E,s.Flux.E,1,"energy flux"); }),
             ("Uniform pipe and reflecting wall",()=>
             {
@@ -48,6 +49,33 @@ public static class Checks
                 var slow=new StereoRingBuffer(8); for(int i=0;i<8;i++) slow.Write(i,i);
                 slow.Read(.5f,out _,out _); slow.Read(.5f,out var v,out _); Near(v,.5,1e-6,"interpolation");
             }),
+            ("PCM lifetime, callback seams and starvation recovery",()=>
+            {
+                var ring=new StereoRingBuffer(); var playback=new PlaybackProcessor(ring);
+                var samples=playback.Samples;
+                var address=System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(samples,0);
+                for(int i=0;i<5000;i++) ring.Write(.3f,.3f);
+                playback.Fill(1); playback.Fill(1);
+                int previous=samples[^2];
+                playback.Fill(1);
+                Require(Math.Abs(samples[0]-previous)<30,"callback seam introduces click");
+                for(int block=0;block<14;block++)
+                {
+                    previous=samples[^2]; playback.Fill(1);
+                    for(int i=0;i<samples.Length;i+=2)
+                    {
+                        Require(Math.Abs(samples[i]-previous)<450,"starvation introduces discontinuity");
+                        previous=samples[i];
+                    }
+                }
+                Require(ring.Underruns>0,"exercise starvation path");
+                for(int i=0;i<5000;i++) ring.Write(.3f,.3f);
+                previous=samples[^2]; playback.Fill(1);
+                Require(Math.Abs(samples[0]-previous)<450,"recovery click");
+                GC.Collect(2,GCCollectionMode.Forced,true,true);
+                Require(address==System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(samples,0),"PCM pointer moved during GC");
+                Require(ReferenceEquals(samples,playback.Samples),"callback allocated replacement PCM");
+            }),
             ("Twin stability, throttle, shift and clutch",()=>
             {
                 var s=new SingleCylScenario(); float idleRpm=0,acceleratedRpm=0;
@@ -82,6 +110,35 @@ public static class Checks
         Near(Mass(),m,m*2e-5,"total mass"); Near(Energy(),e,e*2e-5,"total energy");
         Require(v.Mass>0 && p.Rho.All(x=>x>0),"donor positivity"); Require(p.Repairs==0,"no repairs");
     }
+    private static void SimdAgreement()
+    {
+        var scalar=new PipeSystem { UseSimd=false }; var simd=new PipeSystem();
+        var bs=new BoundarySystem(scalar); var bv=new BoundarySystem(simd);
+        foreach(int count in new[]{1,3,7,8,10,17,31})
+        {
+            var a=scalar.Add($"scalar {count}",.05f*count,.001f,0,0,1,0,count);
+            var b=simd.Add($"simd {count}",.05f*count,.001f,0,0,1,0,count);
+            bs.Connect(a,false); bs.Connect(a,true); bv.Connect(b,false); bv.Connect(b,true);
+            for(int j=0;j<count;j++)
+            {
+                var state=State.FromPT(90000+12000*MathF.Sin(j*.4f),290+20*MathF.Cos(j),12*MathF.Sin(j),.3f+.2f*MathF.Cos(j));
+                scalar.Set(a.Start+j,state); simd.Set(b.Start+j,state);
+            }
+        }
+        var ss=new Solver(scalar,bs,[]); var sv=new Solver(simd,bv,[]);
+        for(int step=0;step<80;step++)
+        {
+            Near(simd.MaxWaveSpeed(),scalar.MaxWaveSpeed(),.002,"CFL max wave speed");
+            ss.Step(Scenario.Dt); sv.Step(Scenario.Dt);
+            for(int i=0;i<scalar.Rho.Length;i++)
+            {
+                var a=scalar.Get(i); var b=simd.Get(i);
+                Near(b.Rho,a.Rho,2e-5,"SIMD density"); Near(b.M,a.M,.002,"SIMD momentum");
+                Near(b.E,a.E,3,"SIMD energy"); Near(b.Air,a.Air,2e-5,"SIMD species");
+            }
+        }
+        Require(simd.Repairs==scalar.Repairs,"SIMD repair accounting");
+    }
     private static void Validate(Scenario s)
     {
         Require(float.IsFinite(s.LastMixL)&&float.IsFinite(s.LastMixR)&&MathF.Abs(s.LastMixL)<=1&&MathF.Abs(s.LastMixR)<=1,"audio bounds");
@@ -90,6 +147,8 @@ public static class Checks
     }
     public static int Headless(Scenario s,string[] args)
     {
+        s.Pipes.UseSimd=!args.Contains("--scalar");
+        if(args.Contains("--flow-only")) { s.Mixer.Mechanical=0; s.Mixer.Wet=0; }
         double seconds=double.Parse(args.FirstOrDefault(a=>a.StartsWith("--seconds="))?.Split('=')[1]??"5",System.Globalization.CultureInfo.InvariantCulture);
         string? wav=args.FirstOrDefault(a=>a.StartsWith("--wav="))?.Substring(6);
         using var file=wav==null?null:new BinaryWriter(File.Create(wav));
@@ -102,7 +161,7 @@ public static class Checks
             s.Process(); Validate(s); peak=MathF.Max(peak,MathF.Abs(s.LastMixL)); square+=s.LastMixL*s.LastMixL;
             file?.Write((short)(s.LastMixL*32767)); file?.Write((short)(s.LastMixR*32767));
         }
-        Console.WriteLine($"{s.Name}: {seconds}s in {watch.Elapsed.TotalSeconds:0.00}s; RPM {s.Crank.Rpm:0}; peak {peak:0.000}; RMS {Math.Sqrt(square/frames):0.000}; repairs {s.Pipes.Repairs}");
+        Console.WriteLine($"{s.Name}: {seconds}s in {watch.Elapsed.TotalSeconds:0.00}s; RPM {s.Crank.Rpm:0}; peak {peak:0.000}; RMS {Math.Sqrt(square/frames):0.000}; repairs {s.Pipes.Repairs}; SIMD {s.Pipes.UseSimd&&System.Numerics.Vector.IsHardwareAccelerated}, lanes {System.Numerics.Vector<float>.Count}");
         return 0;
     }
 }
